@@ -1,92 +1,99 @@
-// index.js - Express backend for Render
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const bodyParser = require('body-parser');
-const btc = require('bitcoinjs-lib');
+const express = require("express");
+const axios = require("axios");
+const btc = require("bitcoinjs-lib");
 
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
+
+const PORT = process.env.PORT || 10000;
 
 const NET = (net) => net === 'testnet' ? btc.networks.testnet : btc.networks.bitcoin;
 const MEMPOOL = (net) => net === 'testnet' ? 'https://mempool.space/testnet/api' : 'https://mempool.space/api';
 
-// Generate key pair
-app.get('/api/generate-key', (req, res) => {
-  const net = req.query.net || 'main';
-  const keyPair = btc.ECPair.makeRandom({ network: NET(net) });
-  const { address } = btc.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NET(net) });
-  res.json({ wif: keyPair.toWIF(), address, network: net });
+// Root: basic status check
+app.get("/", (req, res) => {
+  res.send("✅ BTC Flacon API is running!");
 });
 
-// Fetch UTXOs
-app.get('/api/utxos', async (req, res) => {
-  const { address, net = 'main' } = req.query;
+// Generate new BTC key (WIF + Address)
+app.get("/api/generate-key", (req, res) => {
   try {
-    const { data } = await axios.get(`${MEMPOOL(net)}/address/${address}/utxo`);
+    const net = req.query.net || 'testnet';
+    const network = NET(net);
+
+    const keyPair = btc.ECPair.makeRandom({ network });
+    const { address } = btc.payments.p2wpkh({
+      pubkey: keyPair.publicKey,
+      network,
+    });
+
+    res.json({
+      wif: keyPair.toWIF(),
+      address,
+      network: net,
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to generate key", details: e.message });
+  }
+});
+
+// Get UTXOs for an address
+app.get("/api/utxos", async (req, res) => {
+  const { address, net = "testnet" } = req.query;
+  if (!address) return res.status(400).json({ error: "Missing address param" });
+
+  try {
+    const url = `${MEMPOOL(net)}/address/${address}/utxo`;
+    const { data } = await axios.get(url);
     res.json(data);
   } catch (e) {
-    res.status(400).json({ error: 'Failed to fetch UTXOs' });
+    res.status(500).json({ error: "UTXO fetch failed", details: e.message });
   }
 });
 
 // Broadcast TX
-app.post('/api/broadcast', async (req, res) => {
-  const { hex, net = 'main' } = req.body;
+app.post("/api/broadcast", async (req, res) => {
+  const { hex, net = "testnet" } = req.body;
+  if (!hex) return res.status(400).json({ error: "Missing hex" });
+
   try {
-    const { data } = await axios.post(`${MEMPOOL(net)}/tx`, hex, {
-      headers: { 'Content-Type': 'text/plain' }
+    const url = `${MEMPOOL(net)}/tx`;
+    const { data } = await axios.post(url, hex, {
+      headers: { "Content-Type": "text/plain" },
     });
     res.json({ txid: data });
   } catch (e) {
-    res.status(400).json({ error: e.response?.data || e.message });
+    res.status(500).json({ error: "Broadcast failed", details: e.message });
   }
 });
 
-// Double-spend crafting
-app.post('/api/double-spend', (req, res) => {
-  const { wif, utxo, outputAddress1, outputAddress2, feeRate, net = 'main', enableRBF = false } = req.body;
+// Double-spend broadcast logic (TX-B override)
+app.post("/api/double-spend", async (req, res) => {
+  const { hexA, hexB, net = "testnet" } = req.body;
+  if (!hexA || !hexB) return res.status(400).json({ error: "Missing hexA or hexB" });
 
   try {
-    const network = NET(net);
-    const keyPair = btc.ECPair.fromWIF(wif, network);
+    const url = `${MEMPOOL(net)}/tx`;
 
-    const txb1 = new btc.TransactionBuilder(network);
-    const txb2 = new btc.TransactionBuilder(network);
-
-    txb1.addInput(utxo.txid, utxo.vout);
-    txb2.addInput(utxo.txid, utxo.vout);
-
-    if (enableRBF) {
-      txb1.enableRBF();
-      txb2.enableRBF();
-    }
-
-    const fee = Math.ceil(feeRate * 150);
-    const sendAmount1 = utxo.value - fee;
-    const sendAmount2 = utxo.value - fee - 1000;
-
-    txb1.addOutput(outputAddress1, sendAmount1);
-    txb2.addOutput(outputAddress2, sendAmount2);
-
-    txb1.sign(0, keyPair);
-    txb2.sign(0, keyPair);
-
-    const tx1 = txb1.build().toHex();
-    const tx2 = txb2.build().toHex();
-
-    res.json({
-      tx1: { hex: tx1, txid: btc.Transaction.fromHex(tx1).getId() },
-      tx2: { hex: tx2, txid: btc.Transaction.fromHex(tx2).getId() }
+    // Broadcast TX-A (low fee)
+    await axios.post(url, hexA, {
+      headers: { "Content-Type": "text/plain" },
     });
+
+    // Delay (optional): could add setTimeout here if needed
+
+    // Broadcast TX-B (high fee double-spend)
+    await axios.post(url, hexB, {
+      headers: { "Content-Type": "text/plain" },
+    });
+
+    res.json({ status: "Double-spend attempt broadcasted" });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(500).json({ error: "Double-spend failed", details: e.message });
   }
 });
 
-// Health check
-app.get('/ping', (req, res) => res.send('pong'));
-
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`DoubleSpend API running on port ${PORT}`));
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 BTC Flacon API running on port ${PORT}`);
+});
