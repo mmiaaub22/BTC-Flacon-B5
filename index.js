@@ -1,44 +1,48 @@
-// index.js — Final Render-Compatible Version
+// index.js - BTC Flacon API (Render backend)
+
 const express = require("express");
-const cors = require("cors");
 const axios = require("axios");
-const bodyParser = require("body-parser");
 const bitcoin = require("bitcoinjs-lib");
+
+// ECPair now lives in a separate package
 const ecc = require("tiny-secp256k1");
 const { ECPairFactory } = require("ecpair");
-
-// Create ECPair instance
 const ECPair = ECPairFactory(ecc);
 
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
 
-// Network helper
-const NET = (n) => (n === "testnet" ? bitcoin.networks.testnet : bitcoin.networks.bitcoin);
-const MEMPOOL = (n) =>
-  n === "testnet"
-    ? "https://mempool.space/testnet/api"
-    : "https://mempool.space/api";
+const PORT = process.env.PORT || 10000;
 
-// ----------------------------
-// ROOT ENDPOINT (SHOW STATUS)
-// ----------------------------
+// -------- Helpers --------
+const NET = (net) => {
+  if (net === "main" || net === "mainnet") {
+    return bitcoin.networks.bitcoin;
+  }
+  return bitcoin.networks.testnet; // default to testnet
+};
+
+const MEMPOOL = (net) => {
+  if (net === "main" || net === "mainnet") {
+    return "https://mempool.space/api";
+  }
+  return "https://mempool.space/testnet/api";
+};
+
+// -------- Routes --------
+
+// Root status
 app.get("/", (req, res) => {
-  res.send(`<h2>✅ BTC Flacon API is running!</h2>`);
+  res.send("✅ BTC Flacon API is running!");
 });
 
-// ----------------------------
-// GENERATE KEYPAIR
-// ----------------------------
+// Generate new keypair (WIF + address)
 app.get("/api/generate-key", (req, res) => {
   try {
-    const net = req.query.net || "main";
+    const net = req.query.net || "testnet";
     const network = NET(net);
 
-    // WORKING makeRandom()
     const keyPair = ECPair.makeRandom({ network });
-
     const { address } = bitcoin.payments.p2wpkh({
       pubkey: keyPair.publicKey,
       network,
@@ -49,138 +53,104 @@ app.get("/api/generate-key", (req, res) => {
       address,
       network: net,
     });
-  } catch (err) {
-    res.status(500).json({
-      error: "Failed to generate key",
-      details: err.message,
-    });
+  } catch (e) {
+    res
+      .status(500)
+      .json({ error: "Failed to generate key", details: e.message });
   }
 });
 
-// ----------------------------
-// GET UTXOs
-// ----------------------------
+// Get UTXOs for an address
 app.get("/api/utxos", async (req, res) => {
+  const { address, net = "testnet" } = req.query;
+  if (!address) {
+    return res.status(400).json({ error: "Missing address param" });
+  }
+
   try {
-    const { address, net = "main" } = req.query;
     const url = `${MEMPOOL(net)}/address/${address}/utxo`;
     const { data } = await axios.get(url);
-
     res.json(data);
-  } catch (err) {
+  } catch (e) {
+    res
+      .status(500)
+      .json({ error: "UTXO fetch failed", details: e.message });
+  }
+});
+
+// Fee estimate
+app.get("/api/fee", async (req, res) => {
+  const net = req.query.net || "testnet";
+  try {
+    const { data } = await axios.get(
+      `${MEMPOOL(net)}/v1/fees/recommended`
+    );
+    res.json({
+      minimumFee: data.minimumFee,
+      fastestFee: data.fastestFee,
+      halfHourFee: data.halfHourFee,
+      hourFee: data.hourFee,
+      economyFee: data.economyFee,
+    });
+  } catch (e) {
     res.status(500).json({
-      error: "UTXO fetch failed",
-      details: err.message,
+      error: "Fee lookup failed",
+      details: e.message,
     });
   }
 });
 
-// ----------------------------
-// BROADCAST RAW TX
-// ----------------------------
+// Broadcast a single transaction
 app.post("/api/broadcast", async (req, res) => {
-  try {
-    const { hex, net = "main" } = req.body;
+  const { hex, net = "testnet" } = req.body;
+  if (!hex) {
+    return res.status(400).json({ error: "Missing hex" });
+  }
 
+  try {
     const url = `${MEMPOOL(net)}/tx`;
     const { data } = await axios.post(url, hex, {
       headers: { "Content-Type": "text/plain" },
     });
-
     res.json({ txid: data });
-  } catch (err) {
+  } catch (e) {
     res.status(500).json({
       error: "Broadcast failed",
-      details: err.response?.data || err.message,
+      details: e.response?.data || e.message,
     });
   }
 });
 
-// ----------------------------
-// DOUBLE SPEND BUILDER (PSBT)
-// ----------------------------
-app.post("/api/double-spend", async (req, res) => {
+// Optional: broadcast multiple txs (lab use, e.g. conflicting testnet txs)
+app.post("/api/broadcast-batch", async (req, res) => {
+  const { hexes, net = "testnet" } = req.body;
+  if (!Array.isArray(hexes) || hexes.length === 0) {
+    return res
+      .status(400)
+      .json({ error: "Provide hexes as a non-empty array" });
+  }
+
   try {
-    const {
-      wif,
-      utxo,
-      outputAddress1,
-      outputAddress2,
-      feeRate,
-      net = "main",
-      enableRBF = false,
-    } = req.body;
-
-    const network = NET(net);
-    const keyPair = ECPair.fromWIF(wif, network);
-
-    const psbt1 = new bitcoin.Psbt({ network });
-    const psbt2 = new bitcoin.Psbt({ network });
-
-    const rbfFlag = enableRBF ? 0xfffffffd : undefined;
-
-    // INPUT
-    const inputObj = {
-      hash: utxo.txid,
-      index: utxo.vout,
-      sequence: rbfFlag,
-      witnessUtxo: {
-        script: bitcoin.payments.p2wpkh({
-          pubkey: keyPair.publicKey,
-          network,
-        }).output,
-        value: utxo.value,
-      },
-    };
-
-    psbt1.addInput(inputObj);
-    psbt2.addInput(inputObj);
-
-    // Output amounts
-    const fee = Math.ceil(feeRate * 140);
-    const amount1 = utxo.value - fee;
-    const amount2 = utxo.value - fee - 500;
-
-    psbt1.addOutput({ address: outputAddress1, value: amount1 });
-    psbt2.addOutput({ address: outputAddress2, value: amount2 });
-
-    // Sign
-    psbt1.signAllInputs(keyPair);
-    psbt2.signAllInputs(keyPair);
-
-    psbt1.finalizeAllInputs();
-    psbt2.finalizeAllInputs();
-
-    const tx1 = psbt1.extractTransaction();
-    const tx2 = psbt2.extractTransaction();
-
-    res.json({
-      tx1: {
-        hex: tx1.toHex(),
-        txid: tx1.getId(),
-      },
-      tx2: {
-        hex: tx2.toHex(),
-        txid: tx2.getId(),
-      },
-    });
-  } catch (err) {
+    const url = `${MEMPOOL(net)}/tx`;
+    const results = [];
+    for (const hex of hexes) {
+      const { data } = await axios.post(url, hex, {
+        headers: { "Content-Type": "text/plain" },
+      });
+      results.push({ txid: data });
+    }
+    res.json({ results });
+  } catch (e) {
     res.status(500).json({
-      error: "Double-spend build failed",
-      details: err.message,
+      error: "Batch broadcast failed",
+      details: e.response?.data || e.message,
     });
   }
 });
 
-// ----------------------------
-// HEALTH CHECK
-// ----------------------------
-app.get("/ping", (req, res) => {
-  res.send("pong");
-});
+// Health check
+app.get("/ping", (req, res) => res.send("pong"));
 
-// ----------------------------
-// START SERVER
-// ----------------------------
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`BTC Flacon API running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 BTC Flacon API running on port ${PORT}`);
+});
